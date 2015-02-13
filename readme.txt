@@ -8,7 +8,7 @@ License: CC0
 License URI: http://creativecommons.org/publicdomain/zero/1.0/
 Donate link: -
 
-A Micropub (http://micropub.net/) server plugin.
+A Micropub server plugin.
 
 == Description ==
 
@@ -31,6 +31,9 @@ one hook, `after_micropub($micropub_params, $post_id)`.
 
 Delegates token handling to [tokens.indieauth.com](https://tokens.indieauth.com/).
 
+Development happens at http://github.com/snarfed/wordpress-micropub . Feedback
+and pull requests are welcome!
+
 == Installation ==
 
 Install from the WordPress plugin directory or put `micropub.php` in your plugin directory. No setup needed.
@@ -51,3 +54,8 @@ TODO
 
 = 0.1 =
 Initial release.
+
+== Development ==
+
+The canonical repo is http://github.com/snarfed/wordpress-micropub . Feedback
+and pull requests are welcome!
