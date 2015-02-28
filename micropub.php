@@ -5,12 +5,22 @@
  Description: <a href="https://indiewebcamp.com/micropub">Micropub</a> server.
  Author: Ryan Barrett
  Author URI: https://snarfed.org/
- Version: 0.2
+ Version: 0.3
 */
 
 // Example command line for testing:
 // curl -i -H 'Authorization: Bearer ...' -F h=entry -F name=foo -F content=bar \
 //   -F photo=@gallery/snarfed.gif 'http://localhost/w/?micropub=endpoint'
+//
+// To generate an access token for testing:
+// 1. Log into https://indieauth.com/
+// 2. Extract the code param from the URL.
+// 3. Run this command line, filling in CODE and SITE (which logged into IndieAuth):
+//   curl -i -d 'code=CODE&me=SITE&client_id=indieauth&redirect_uri=https://indieauth.com/success' 'https://tokens.indieauth.com/token'
+// 4. Extract the access_token parameter from the response body.
+//
+// Note that this does *not* include scope=post. TODO: instructions to generate
+// a token with that.
 
 if (!class_exists('Micropub')) :
 
@@ -63,13 +73,11 @@ class Micropub {
     }
     header('Content-Type: text/plain; charset=' . get_option('blog_charset'));
 
-    Micropub::authorize();
+    $user_id = Micropub::authorize();
 
     // validate micropub request params
     if (!isset($_POST['h']) && !isset($_POST['url'])) {
-      status_header(400);
-      echo 'requires either h= (for create) or url= (for update, delete, etc)';
-      exit;
+      Micropub::error(400, 'requires either h= (for create) or url= (for update, delete, etc)');
     }
 
     // support both action= and operation= parameter names
@@ -79,8 +87,14 @@ class Micropub {
     }
 
     $args = apply_filters('before_micropub', Micropub::generate_args());
+    if ($user_id) {
+      $args['post_author'] = $user_id;
+    }
 
     if (!isset($_POST['url']) || $_POST['action'] == 'create') {
+      if ($user_id && !user_can($user_id, 'publish_posts')) {
+        Micropub::error(403, 'user id ' . $user_id . ' cannot publish posts');
+      }
       $args['post_status'] = 'publish';
       kses_remove_filters();  // prevent sanitizing HTML tags in post_content
       $args['ID'] = Micropub::check_error(wp_insert_post($args));
@@ -91,18 +105,23 @@ class Micropub {
 
     } else {
       if ($args['ID'] == 0) {
-        status_header(400);
-        echo $_POST['url'] . ' not found';
-        exit;
+        Micropub::error(400, $_POST['url'] . ' not found');
       }
 
       if ($_POST['action'] == 'edit' || !isset($_POST['action'])) {
+        if ($user_id && !user_can($user_id, 'edit_posts')) {
+          Micropub::error(403, 'user id ' . $user_id . ' cannot edit posts');
+        }
         kses_remove_filters();  // prevent sanitizing HTML tags in post_content
         Micropub::check_error(wp_update_post($args));
         kses_init_filters();
         Micropub::postprocess($args['ID']);
         status_header(200);
+
       } elseif ($_POST['action'] == 'delete') {
+        if ($user_id && !user_can($user_id, 'delete_posts')) {
+          Micropub::error(403, 'user id ' . $user_id . ' cannot delete posts');
+        }
         Micropub::check_error(wp_trash_post($args['ID']));
         status_header(200);
       // TODO: figure out how to make url_to_postid() support posts in trash
@@ -115,9 +134,7 @@ class Micropub {
       //   )));
       //   status_header(200);
       } else {
-        status_header(400);
-        echo 'unknown action ' . $_POST['action'];
-        exit;
+        Micropub::error(400, 'unknown action ' . $_POST['action']);
       }
     }
     do_action('after_micropub', $args['ID']);
@@ -126,8 +143,12 @@ class Micropub {
 
   /**
    * Use tokens.indieauth.com to validate the access token.
+   *
+   * If the token is valid, returns the user id to use as the post's author, or
+   * NULL if the token only matched the site URL and no specific user.
    */
   private static function authorize() {
+    // find the access token
     $headers = getallheaders();
     if (isset($headers['Authorization'])) {
       $auth_header = $headers['Authorization'];
@@ -137,6 +158,7 @@ class Micropub {
       return Micropub::handle_authorize_error(401, 'missing access token');
     }
 
+    // verify it with tokens.indieauth.com
     $resp = wp_remote_get('https://tokens.indieauth.com/token',
                           array('headers' => array(
                             'Content-type' => 'application/x-www-form-urlencoded',
@@ -146,19 +168,34 @@ class Micropub {
     if ($code / 100 != 2) {
       return Micropub::handle_authorize_error(
         $code, 'invalid access token: ' . $body);
-    }
-
-    parse_str($body, $resp);
-    $home = untrailingslashit(home_url());
-    $me = untrailingslashit($resp['me']);
-    if ($home != $me) {
-      return Micropub::handle_authorize_error(
-        401, 'access token URL ' . $me . " doesn't match " . $home);
     } else if (!isset($resp['scope']) ||
                !in_array('post', explode(' ', $resp['scope']))) {
       return Micropub::handle_authorize_error(
         403, 'access token is missing post scope; got ' . $resp['scope']);
     }
+
+    parse_str($body, $resp);
+    $me = untrailingslashit($resp['me']);
+
+    // look for a user with the same url as the token's `me` value. search both
+    // with and without trailing slash.
+    foreach (array_merge(get_users(array('search' => $me)),
+                         get_users(array('search' => $me . '/')))
+                         as $user) {
+      if (untrailingslashit($user->user_url) == $me) {
+        return $user->ID;
+      }
+    }
+
+    // no user with that url. if the token is for this site itself, allow it and
+    // post as the default user
+    $home = untrailingslashit(home_url());
+    if ($home != $me) {
+      return Micropub::handle_authorize_error(
+        401, 'access token URL ' . $me . " doesn't match site " . $home . ' or any user');
+    }
+
+    return NULL;
   }
 
   private static function handle_authorize_error($code, $msg) {
@@ -168,9 +205,7 @@ class Micropub {
           ". Allowing only because this is localhost.\n";
         return;
     }
-    status_header($code);
-    echo $msg;
-    exit;
+    Micropub::error($code, $msg);
   }
 
   /**
@@ -198,6 +233,7 @@ class Micropub {
 
     if (isset($_POST['published'])) {
       $args['post_date'] = iso8601_to_datetime($_POST['published']);
+      $args['post_date_gmt'] = get_gmt_from_date($args['post_date']);
     }
 
     // Map micropub categories to WordPress categories if they exist, otherwise
@@ -230,17 +266,18 @@ class Micropub {
    * and friends.
    */
   private static function generate_post_content() {
+    $verbs = array('like' => 'Likes',
+                   'repost' => 'Reposted',
+                   'in-reply-to' => 'In reply to');
+
     // interactions
     foreach (array('like', 'repost', 'in-reply-to') as $cls) {
       $val = isset($_POST[$cls]) ? $_POST[$cls]
              : (isset($_POST[$cls . '-of']) ? $_POST[$cls . '-of']
              : NULL);
       if ($val) {
-        if ($cls != 'in-reply-to') {
-          $cls .= 's';
-        }
-        $lines[] = '<p>' . ucfirst(str_replace('-', ' ', $cls)) .
-          ' <a class="u-' . $cls . ' href="' . $val . '">' . $val . '</a>.</p>';
+        $lines[] = '<p>' . $verbs[$cls] .
+          ' <a class="u-' . $cls . '-of" href="' . $val . '">' . $val . '</a>.</p>';
       }
     }
 
@@ -361,15 +398,17 @@ class Micropub {
     }
   }
 
+  private static function error($code, $msg) {
+    status_header($code);
+    echo $msg . "\r\n";
+    exit;
+  }
+
   private static function check_error($result) {
     if (!$result) {
-      status_header(500);
-      echo 'Unknown WordPress error: ' . $result;
-      exit;
+      Micropub::error(500, 'Unknown WordPress error: ' . $result);
     } else if (is_wp_error($result)) {
-      status_header(500);
-      echo $result->get_error_message();
-      exit;
+      Micropub::error(500, $result->get_error_message());
     }
     return $result;
   }
